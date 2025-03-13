@@ -284,6 +284,8 @@ def handle_message(event):
                     for ext in image_extensions:
                         image_path = f"{env_config.STATIC_FOLDER}/store_images/{menu_image}.{ext}"
                         if os.path.exists(image_path):
+                            # 使用正斜線替換反斜線
+                            image_path = image_path.replace("\\", "/")
                             url = f"{request.url_root}{image_path}".replace("http", "https")
                             break
                     else:
