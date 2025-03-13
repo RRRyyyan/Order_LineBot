@@ -286,7 +286,7 @@ def handle_message(event):
                         if os.path.exists(image_path):
                             # 使用正斜線替換反斜線
                             image_path = image_path.replace("\\", "/")
-                            url = f"{request.url_root}{image_path}".replace("http", "https")
+                            url = f"{request.url_root}{image_path}?t={int(time.time())}".replace("http://", "https://")
                             break
                     else:
                         url = None  # 如果沒有找到對應的圖片，設為 None 或其他處理方式
