@@ -138,3 +138,27 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
         redis_key = f'group_order:{group_order_id}:orders'  # 生成 Redis 鍵
         order = self.redis.hget(redis_key, user_id)  # 獲取特定用戶的訂單
         return json.loads(order.decode()) if order else None  # 返回解析後的訂單，或者如果不存在則返回 None
+    
+    def delete_user_order(self, group_order_id, user_id):
+        """刪除訂單"""
+        try:
+            # 從 PostgreSQL 刪除所有符合條件的訂單
+            user_orders = UserOrder.query.filter_by(
+                group_order_id=group_order_id,
+                user_id=user_id
+            ).all()  # 使用 .all() 取得所有符合的訂單
+            
+            if user_orders:
+                for order in user_orders:
+                    db.session.delete(order)
+                db.session.commit()
+                
+                # 修正：使用正確的 Redis 鍵值格式
+                redis_key = f'group_order:{group_order_id}:orders'  # 與 get_user_order 使用相同的鍵值格式
+                self.redis.hdel(redis_key, user_id)  # 使用 hdel 刪除 hash 中的特定欄位
+                return True
+            return False
+        except Exception as e:
+            print(f"刪除訂單時發生錯誤: {e}")
+            db.session.rollback()  # 發生錯誤時回滾事務
+            return False

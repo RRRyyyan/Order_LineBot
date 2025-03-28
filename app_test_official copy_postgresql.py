@@ -235,8 +235,20 @@ def handle_message(event):
                             
                             # 生成訂單總結
                             summary = f"{restaurant} 團購總結：\n"
+                            summary += "=================\n"
                             for item, count in counter.items():
                                 summary += f"{item}: {count}份\n"
+                            
+                            # 加入個人訂單詳細資訊
+                            summary += "\n個人訂單明細：\n"
+                            summary += "=================\n"
+                            for user_id, items in all_orders.items():
+                                # 取得用戶名稱
+                                user_name = get_user_name(user_id)
+                                # 計算個人訂單項目
+                                personal_counter = Counter(items)
+                                personal_items = ", ".join([f"{item}*{count}" for item, count in personal_counter.items()])
+                                summary += f"{user_name}：{personal_items}\n"
                             
                             reply_text = f"{restaurant} 團購已關閉！\n\n{summary}"
                         else:
@@ -290,7 +302,7 @@ def handle_message(event):
                         title=restaurant,
                             text=f"開團者: {leader_name}\n開團中 - 已有{len(db_manager.get_user_orders(order['id']))}人點餐",
                         actions=[
-                            PostbackAction(label="選擇此團購", data=f"select_group_{order['id']}"),
+                            PostbackAction(label="加入此團購", data=f"select_group_{order['id']}"),
                             PostbackAction(label="菜單價目表", data=f"menu_{restaurant}", text=f"查看{restaurant}的菜單"),
                         ]
                     )
@@ -332,11 +344,27 @@ def handle_message(event):
             restaurant = order['restaurant']
             meal_text = text.replace("我要點", "").strip()
             if not meal_text:
-                reply_text = "請輸入餐點名稱，例如：我要點 珍珠奶茶"
+                reply_text = "請輸入餐點名稱，例如：我要點 珍珠奶茶(微糖微冰)"
             else:
-                meals = [meal.strip() for meal in re.split(r"[ ;,、]", meal_text) if meal.strip()]
-                db_manager.add_user_order(group_order_id, user_id, meals)
-                reply_text = f"已記錄 {', '.join(meals)} 到 {restaurant} 團購！"
+                # 分割點餐品項
+                new_meals = [meal.strip() for meal in re.split(r"[ ;,、]", meal_text) if meal.strip()]
+                
+                # 獲取現有訂單
+                existing_order = db_manager.get_user_order(group_order_id, user_id)
+                if existing_order:
+                    # 合併現有訂單和新訂單
+                    all_meals = existing_order + new_meals
+                    # 使用 Counter 統計所有品項數量
+                    meal_counter = Counter(all_meals)
+                    # 格式化輸出，將每個品項加上數量
+                    order_summary = "、".join([f"{item}*{count}" for item, count in meal_counter.items()])
+                    reply_text = f"已將 {', '.join(new_meals)} 加入您在 {restaurant} 的訂單中！\n目前訂單：{order_summary}"
+                else:
+                    all_meals = new_meals
+                    reply_text = f"已記錄 {', '.join(new_meals)} 到 {restaurant} 團購！"
+                
+                # 更新訂單
+                db_manager.add_user_order(group_order_id, user_id, all_meals)
             
             line_bot_api.reply_message(
                 ReplyMessageRequest(
@@ -349,6 +377,7 @@ def handle_message(event):
             if not active_orders:
                 reply_text = "目前沒有進行中的團購！"
                 line_bot_api.reply_message(
+
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
                         messages=[TextMessage(text=reply_text)],
@@ -401,7 +430,10 @@ def handle_message(event):
                             thumbnail_image_url=url,
                             title=restaurant,
                             text=items_text if items_text else "無訂單項目",
-                            actions=[PostbackAction(label="修改訂單", data=f"edit_order_{order['order_id']}")]
+                            actions=[
+                                PostbackAction(label="修改訂單", data=f"edit_order_{order['order_id']}"),
+                                PostbackAction(label="刪除訂單", data=f"delete_order_{order['order_id']}")
+                            ]
                         )
                         columns.append(column)
 
@@ -458,7 +490,7 @@ def handle_postback(event):
             if order:
                 # 儲存用戶選擇的團購
                 redis_client.set(f'user:{user_id}:selected_group', group_order_id)
-                reply_text = f"您已選擇 {order['restaurant']} 的團購，請輸入「我要點 餐點名稱」開始點餐！"
+                reply_text = f"您已選擇 {order['restaurant']} 的團購，請輸入「我要點 餐點名稱(備註)」開始點餐！"
             else:
                 reply_text = "此團購已不存在！"
             
@@ -476,7 +508,7 @@ def handle_postback(event):
             if order:
                 # 儲存用戶選擇的團購
                 redis_client.set(f'user:{user_id}:selected_group', group_order_id)
-                reply_text = f"您已選擇修改 {order['restaurant']} 的訂單，請輸入「我要點 餐點名稱」重新點餐！"
+                reply_text = f"您已選擇修改 {order['restaurant']} 的訂單，請輸入「我要點 餐點名稱(備註)」重新點餐！"
             else:
                 reply_text = "此團購已不存在！"
             
@@ -523,7 +555,19 @@ def handle_postback(event):
                     messages=[ImageMessage(original_content_url=url, preview_image_url=url)]
                 )
             )
-
+        elif data.startswith("delete_order_"):
+            group_order_id = data.replace("delete_order_", "")
+            if db_manager.delete_user_order(group_order_id, user_id):
+                reply_text = "您的訂單已成功刪除！"
+            else:
+                reply_text = "刪除訂單失敗，可能訂單已不存在。"
+            
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
 
 def create_rich_menu():
     """創建 LINE Bot 的 Rich Menu"""
