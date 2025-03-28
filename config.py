@@ -28,6 +28,12 @@ class Config:
     STATIC_FOLDER = "static"
     RICH_MENU_IMAGE = "richmenu.png"
     LOGO_IMAGE = "Logo.jpg"
+
+    ## PostgreSQl與redis設置
+    SQLALCHEMY_DATABASE_URI = "postgresql://postgres:ryan0404@localhost:5432/line_bot_db"
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    REDIS_URL = "redis://localhost:6379/0"
+
 class DevelopmentConfig(Config):
    DEBUG = True
    # 開發環境特定的設定
