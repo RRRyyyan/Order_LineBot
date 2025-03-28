@@ -21,7 +21,8 @@ from linebot.v3.messaging import (
     MessageAction,
     URIAction,
     QuickReply,
-    QuickReplyItem
+    QuickReplyItem,
+    DatetimePickerAction
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -36,6 +37,8 @@ import requests
 import json
 import time
 from redis import Redis
+from datetime import datetime, timedelta, UTC
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # 導入 Config 文件中的配置
 from config import get_config, Config, OrderConfig, LineBotConfig
@@ -106,17 +109,33 @@ def handle_open_group(event, text, user_id):
                 leader_id = existing_order['leader_id']
                 leader_name = get_user_name(leader_id)
                 reply_text = f"{restaurant} 團購已經開啟，開團者: {leader_name}，請先閉團再開新團！"
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)],
+                    )
+                )
             else:
                 # 創建新的團購
-                db_manager.create_group_order(restaurant, user_id)
-                reply_text = f"{restaurant} 團購已開啟，請輸入「目前團購」選擇團購並開始點餐！"
-        
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)],
-            )
-        )
+                group_order = db_manager.create_group_order(restaurant, user_id)
+                
+                # 使用 Datetime Picker Template
+                buttons_template = ButtonsTemplate(
+                    title=f"{restaurant} 團購",
+                    text="請選擇閉團時間",
+                    actions=[
+                        DatetimePickerAction(
+                            label="選擇時間",
+                            data=f"set_time_{group_order.id}",
+                            mode="time"
+                        )
+                    ]
+                )
+                template_message = TemplateMessage(alt_text="選擇閉團時間", template=buttons_template)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[template_message])
+                )
+                return
 
 @line_handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
@@ -443,6 +462,30 @@ def handle_message(event):
                         ReplyMessageRequest(reply_token=event.reply_token, messages=[template_message])
                     )
 
+        # 處理自訂時間輸入
+        elif redis_client.get(f'waiting_time_input:{user_id}'):
+            try:
+                minutes = int(text)
+                if minutes <= 0 or minutes > 1440:  # 限制在1-1440分鐘內（24小時）
+                    reply_text = "請輸入1-1440之間的有效數字！"
+                else:
+                    group_order_id = redis_client.get(f'waiting_time_input:{user_id}').decode()
+                    close_time = datetime.now(UTC) + timedelta(minutes=minutes)
+                    if db_manager.set_group_order_close_time(group_order_id, close_time):
+                        reply_text = f"已設定 {minutes} 分鐘後自動閉團！"
+                    else:
+                        reply_text = "設定閉團時間失敗，團購可能已不存在。"
+                    redis_client.delete(f'waiting_time_input:{user_id}')
+            except ValueError:
+                reply_text = "請輸入有效的數字！"
+            
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)],
+                )
+            )
+
 @line_handler.add(PostbackEvent)
 def handle_postback(event):
     with ApiClient(configuration) as api_client:
@@ -568,6 +611,37 @@ def handle_postback(event):
                     messages=[TextMessage(text=reply_text)]
                 )
             )
+        elif data.startswith("set_time_"):
+            group_order_id = data.replace("set_time_", "")
+            selected_time = event.postback.params.get('time')  # 獲取用戶選擇的時間
+            
+            if selected_time:
+                # 解析選擇的時間
+                hour, minute = map(int, selected_time.split(':'))
+                now = datetime.now(UTC)
+                close_time = now.replace(hour=(hour-8), minute=minute)  # 調整為 UTC 時間
+                
+                # 如果選擇的時間比現在早，就設定為明天的同一時間
+                if close_time <= now:
+                    close_time = close_time + timedelta(days=1)
+                
+                # 從 Redis 獲取團購資訊
+                active_orders = db_manager.get_active_orders()
+                order = next((order for order in active_orders if order['id'] == group_order_id), None)
+                restaurant = order['restaurant'] if order else "此團購"
+                
+                if db_manager.set_group_order_close_time(group_order_id, close_time):
+                    local_time = (close_time + timedelta(hours=8)).strftime("%H:%M")  # 轉換為台灣時間
+                    reply_text = f"{restaurant} 團購已開啟，將於{'今天' if close_time.date() == now.date() else '明天'} {local_time} 自動閉團！\n請輸入「目前團購」選擇團購並開始點餐！"
+                else:
+                    reply_text = "設定閉團時間失敗，團購可能已不存在。"
+                    
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
+                    )
+                )
 
 def create_rich_menu():
     """創建 LINE Bot 的 Rich Menu"""
@@ -659,6 +733,13 @@ def initialize_redis_and_db():
     except Exception as e:
         print(f"初始化資料庫時發生錯誤: {e}")
 
+# 定時檢查並關閉到期的團購
+def check_and_close_orders():
+    print("檢查是否有需要自動閉團的團購...")
+    closed_orders = db_manager.check_and_close_expired_orders()
+    if closed_orders:
+        print(f"已自動關閉 {len(closed_orders)} 個團購")
+
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
@@ -673,5 +754,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"檢查 rich menu 時發生錯誤: {e}")
         create_rich_menu()
+    
     initialize_redis_and_db()  # 啟動時初始化兩個資料庫
+    
+    # 設置定時任務，每分鐘檢查一次是否有需要自動閉團的團購
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(check_and_close_orders, 'interval', minutes=1)
+    scheduler.start()
+    
     app.run(debug=True)

@@ -13,6 +13,7 @@ class GroupOrder(db.Model):  # 定義 GroupOrder 模型
     status = db.Column(db.String(20), default='open')  # 定義團購狀態欄位，預設為 'open'
     created_at = db.Column(db.DateTime, default=datetime.now(UTC))  # 定義創建時間欄位，預設為 UTC 時區的當前時間
     closed_at = db.Column(db.DateTime)  # 定義關閉時間欄位
+    close_time = db.Column(db.DateTime)  # 新增: 預計閉團時間欄位
 
 class UserOrder(db.Model):  # 定義 UserOrder 模型
     __tablename__ = 'user_orders'  # 定義資料表名稱
@@ -162,3 +163,47 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
             print(f"刪除訂單時發生錯誤: {e}")
             db.session.rollback()  # 發生錯誤時回滾事務
             return False
+
+    def set_group_order_close_time(self, group_order_id, close_time):
+        """設定團購閉團時間"""
+        try:
+            # 更新 PostgreSQL
+            group_order = GroupOrder.query.get(group_order_id)
+            if group_order:
+                group_order.close_time = close_time
+                db.session.commit()
+                
+                # 更新 Redis
+                redis_key = f'group_order:{group_order_id}'
+                self.redis.hset(redis_key, 'close_time', close_time.isoformat())
+                return True
+            return False
+        except Exception as e:
+            print(f"設定閉團時間時發生錯誤: {e}")
+            return False
+    
+    def check_and_close_expired_orders(self):
+        """檢查並關閉已到期的團購"""
+        try:
+            # 從 PostgreSQL 獲取所有開啟的團購
+            current_time = datetime.now(UTC)
+            orders_to_close = GroupOrder.query.filter(
+                GroupOrder.status == 'open',
+                GroupOrder.close_time <= current_time
+            ).all()
+            
+            closed_orders = []
+            
+            # 關閉已到期的團購
+            for order in orders_to_close:
+                self.close_group_order(order.restaurant, order.leader_id)
+                closed_orders.append({
+                    'id': order.id,
+                    'restaurant': order.restaurant,
+                    'leader_id': order.leader_id
+                })
+            
+            return closed_orders
+        except Exception as e:
+            print(f"檢查並關閉到期團購時發生錯誤: {e}")
+            return []
