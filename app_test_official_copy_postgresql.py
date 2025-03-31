@@ -37,29 +37,31 @@ import requests
 import json
 import time
 from redis import Redis
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, UTC, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # 導入 Config 文件中的配置
 from config import get_config, Config, OrderConfig, LineBotConfig
-from database import db, DatabaseManager, GroupOrder, UserOrder 
-
+from database import app,db,DatabaseManager, GroupOrder, UserOrder 
 from flask_sqlalchemy import SQLAlchemy
 
-# 初始化 Flask 應用
-app = Flask(__name__, static_folder='static')
+
+# db = SQLAlchemy()
+# # 初始化 Flask 應用
+# app = Flask(__name__, static_folder='static')
 
 # 獲取環境配置 (預設為 development)
 env_config = get_config('development' if app.debug else 'production')
 
-# 配置 SQLAlchemy
-app.config['SQLALCHEMY_DATABASE_URI'] = env_config.SQLALCHEMY_DATABASE_URI
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db.init_app(app)
+# # 配置 SQLAlchemy
+# app.config['SQLALCHEMY_DATABASE_URI'] = env_config.SQLALCHEMY_DATABASE_URI
+# app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# db.init_app(app)
 
 # 初始化 Redis 和資料庫管理器
 redis_client = Redis.from_url(env_config.REDIS_URL)
 db_manager = DatabaseManager(redis_client)
+
 
 # LINE Bot 配置
 configuration = Configuration(
@@ -119,21 +121,38 @@ def handle_open_group(event, text, user_id):
                 # 創建新的團購
                 group_order = db_manager.create_group_order(restaurant, user_id)
                 
+
                 # 使用 Datetime Picker Template
-                buttons_template = ButtonsTemplate(
-                    title=f"{restaurant} 團購",
-                    text="請選擇閉團時間",
-                    actions=[
-                        DatetimePickerAction(
-                            label="選擇時間",
-                            data=f"set_time_{group_order.id}",
-                            mode="time"
+                now_utc = datetime.now(timezone.utc)  # 獲取當前 UTC 時間
+                taiwan_time = now_utc + timedelta(hours=8)  # 將 UTC 時間轉換為台灣時間
+                min_time = taiwan_time.strftime("%Y-%m-%dT%H:%M")
+                # 使用 Datetime Picker Template
+                # buttons_template = ButtonsTemplate(
+                #     title=f"{restaurant} 團購",
+                #     text="請選擇閉團時間",
+                #     actions=[
+                #         DatetimePickerAction(
+                #             label="選擇時間",
+                #             data=f"set_time_{group_order.id}",
+                #             mode="datetime",
+                #             min=min_time  # 設置最小可選擇的時間為現在
+                #         )
+                #     ]
+                # )
+                quick_reply = QuickReply(items=[
+                        QuickReplyItem(
+                            action=DatetimePickerAction(
+                                label="選擇閉團時間",
+                                data=f"set_time_{group_order.id}",
+                                mode="datetime",
+                                min=min_time
+                            )
                         )
-                    ]
-                )
-                template_message = TemplateMessage(alt_text="選擇閉團時間", template=buttons_template)
+                    ])
+                # template_message = TemplateMessage(alt_text="選擇閉團時間", template=buttons_template)
+                reply_message = TextMessage(text=f"{restaurant} 團購開啟，請選擇閉團時間：", quick_reply=quick_reply)
                 line_bot_api.reply_message(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[template_message])
+                    ReplyMessageRequest(reply_token=event.reply_token, messages=[reply_message])
                 )
                 return
 
@@ -298,7 +317,18 @@ def handle_message(event):
                 for order in active_orders:
                     restaurant = order['restaurant']
                     leader_id = order['leader_id']
-                    leader_name = get_user_name(leader_id)  # 使用 get_user_name 取得真實名稱                    
+                    leader_name = get_user_name(leader_id)  # 使用 get_user_name 取得真實名稱  
+                    close_time = order['close_time']  # 獲取閉團時間     
+                    # 檢查 close_time 是否為有效的 datetime 對象
+                    if isinstance(close_time, str):
+                        try:
+                            # 將字符串轉換為 datetime 對象，假設它是 ISO 格式
+                            close_time = datetime.fromisoformat(close_time)
+                        except ValueError:
+                            close_time = None  # 如果轉換失敗，設置為 None
+
+                    # 格式化閉團時間
+                    close_time_str = close_time.strftime("%Y-%m-%d %H:%M") if close_time else "未設定"  # 格式化閉團時間             
                     # 支援的圖片格式
                     image_extensions = ['jpg', 'png', 'jpeg']
                     menu_image = env_config.MENU_DICT.get(restaurant)
@@ -319,7 +349,7 @@ def handle_message(event):
                     column = CarouselColumn(
                         thumbnail_image_url=url,
                         title=restaurant,
-                            text=f"開團者: {leader_name}\n開團中 - 已有{len(db_manager.get_user_orders(order['id']))}人點餐",
+                            text=f"開團者: {leader_name}\n閉團時間: {close_time_str}\n開團中 - 已有{len(db_manager.get_user_orders(order['id']))}人點餐",
                         actions=[
                             PostbackAction(label="加入此團購", data=f"select_group_{order['id']}"),
                             PostbackAction(label="菜單價目表", data=f"menu_{restaurant}", text=f"查看{restaurant}的菜單"),
@@ -613,17 +643,14 @@ def handle_postback(event):
             )
         elif data.startswith("set_time_"):
             group_order_id = data.replace("set_time_", "")
-            selected_time = event.postback.params.get('time')  # 獲取用戶選擇的時間
+            selected_time = event.postback.params.get('datetime')  # 獲取用戶選擇的時間
             
             if selected_time:
-                # 解析選擇的時間
-                hour, minute = map(int, selected_time.split(':'))
-                now = datetime.now(UTC)
-                close_time = now.replace(hour=(hour-8), minute=minute)  # 調整為 UTC 時間
+                # 解析選擇的日期和時間
+                close_time = datetime.fromisoformat(selected_time) 
+                # 確保時間是 UTC
+                close_time = close_time.replace(tzinfo=UTC)
                 
-                # 如果選擇的時間比現在早，就設定為明天的同一時間
-                if close_time <= now:
-                    close_time = close_time + timedelta(days=1)
                 
                 # 從 Redis 獲取團購資訊
                 active_orders = db_manager.get_active_orders()
@@ -631,8 +658,8 @@ def handle_postback(event):
                 restaurant = order['restaurant'] if order else "此團購"
                 
                 if db_manager.set_group_order_close_time(group_order_id, close_time):
-                    local_time = (close_time + timedelta(hours=8)).strftime("%H:%M")  # 轉換為台灣時間
-                    reply_text = f"{restaurant} 團購已開啟，將於{'今天' if close_time.date() == now.date() else '明天'} {local_time} 自動閉團！\n請輸入「目前團購」選擇團購並開始點餐！"
+                    local_time = close_time.strftime("%Y-%m-%d %H:%M")  # 格式化為可讀的時間
+                    reply_text = f"{restaurant} 團購已開啟，，將於 {local_time} 自動閉團！\n請輸入「目前團購」選擇團購並開始點餐！"
                 else:
                     reply_text = "設定閉團時間失敗，團購可能已不存在。"
                     

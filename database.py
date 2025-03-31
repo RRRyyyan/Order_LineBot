@@ -1,9 +1,22 @@
+from flask import Flask
 from flask_sqlalchemy import SQLAlchemy  # 引入 Flask-SQLAlchemy 來處理資料庫交互
 from redis import Redis  # 引入 Redis 來處理緩存
 import json  # 引入 json 來處理 JSON 資料
-from datetime import datetime, UTC  # 引入 datetime 來處理日期時間，UTC 來處理時區
+from datetime import datetime, UTC, timedelta,timezone  # 引入 datetime 來處理日期時間，UTC 來處理時區
+from config import get_config
+db = SQLAlchemy()
+# 初始化 Flask 應用
+app = Flask(__name__, static_folder='static')
 
-db = SQLAlchemy()  # 創建 SQLAlchemy 實例
+# 獲取環境配置 (預設為 development)
+env_config = get_config('development' if app.debug else 'production')
+
+# 配置 SQLAlchemy
+app.config['SQLALCHEMY_DATABASE_URI'] = env_config.SQLALCHEMY_DATABASE_URI
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db.init_app(app)
+
+
 
 class GroupOrder(db.Model):  # 定義 GroupOrder 模型
     __tablename__ = 'group_orders'  # 定義資料表名稱
@@ -13,7 +26,7 @@ class GroupOrder(db.Model):  # 定義 GroupOrder 模型
     status = db.Column(db.String(20), default='open')  # 定義團購狀態欄位，預設為 'open'
     created_at = db.Column(db.DateTime, default=datetime.now(UTC))  # 定義創建時間欄位，預設為 UTC 時區的當前時間
     closed_at = db.Column(db.DateTime)  # 定義關閉時間欄位
-    close_time = db.Column(db.DateTime)  # 新增: 預計閉團時間欄位
+    close_time = db.Column(db.DateTime(timezone=True))  # 新增: 預計閉團時間欄位，並指定為 UTC 時間  # 新增: 預計閉團時間欄位
 
 class UserOrder(db.Model):  # 定義 UserOrder 模型
     __tablename__ = 'user_orders'  # 定義資料表名稱
@@ -29,23 +42,35 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
 
     def create_group_order(self, restaurant, leader_id):  # 創建新的團購
         """創建新的團購"""
-        group_order = GroupOrder(
-            restaurant=restaurant,
-            leader_id=leader_id,
-            status='open'
-        )
-        db.session.add(group_order)  # 將團購添加到資料庫會話中
-        db.session.commit()  # 提交資料庫變更
-        
-        # 在 Redis 中設置即時狀態
-        redis_key = f'group_order:{group_order.id}'  # 生成 Redis 鍵
-        self.redis.hset(redis_key, mapping={
-            'restaurant': restaurant,
-            'leader_id': leader_id,
-            'status': 'open',
-            'created_at': str(datetime.now(UTC))
-        })  # 使用 Redis 的 Hash 類型存儲團購信息
-        return group_order  # 返回創建的團購實例
+        try:
+            group_order = GroupOrder(
+                restaurant=restaurant,
+                leader_id=leader_id,
+                status='open',
+                close_time=datetime.now(UTC) + timedelta(hours=24)  # 預設24小時後關閉
+            )
+            db.session.add(group_order)
+            db.session.commit()
+            
+            # 在 Redis 中設置即時狀態
+            redis_key = f'group_order:{group_order.id}'
+            try:
+                self.redis.hset(redis_key, mapping={
+                    'restaurant': restaurant,
+                    'leader_id': leader_id,
+                    'status': 'open',
+                    'created_at': str(datetime.now(UTC)),
+                    'close_time': group_order.close_time.isoformat() if group_order.close_time else ''
+                })
+            except Exception as redis_error:
+                print(f"Redis 錯誤: {redis_error}")
+                # Redis 錯誤不應該影響主要功能，所以只記錄不拋出
+                
+            return group_order
+        except Exception as e:
+            print(f"創建團購時發生錯誤: {e}")
+            db.session.rollback()  # 回滾資料庫事務
+            raise  # 重新拋出異常以便上層處理
 
     def get_active_orders(self):
         try:
@@ -75,7 +100,9 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
                             # 解碼並提取餐廳名稱
                             'restaurant': order_data[b'restaurant'].decode(),
                             # 解碼並提取訂單發起人（團長）的 ID
-                            'leader_id': order_data[b'leader_id'].decode()
+                            'leader_id': order_data[b'leader_id'].decode(),
+                            # 解碼並提取訂單的閉團時間
+                            'close_time': order_data[b'close_time'].decode()
                         })
                 except Exception as e:
                     # 如果處理單個訂單時出現異常，捕獲並列印錯誤，然後繼續處理下一個訂單
@@ -166,11 +193,13 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
 
     def set_group_order_close_time(self, group_order_id, close_time):
         """設定團購閉團時間"""
+        # 確保 close_time 是 UTC 時間
+        close_time = close_time.astimezone(timezone.utc)  # 確保寫入的是 UTC 時間
         try:
             # 更新 PostgreSQL
             group_order = GroupOrder.query.get(group_order_id)
             if group_order:
-                group_order.close_time = close_time
+                group_order.close_time = close_time.astimezone(timezone.utc).replace(tzinfo=None)
                 db.session.commit()
                 
                 # 更新 Redis
@@ -185,25 +214,26 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
     def check_and_close_expired_orders(self):
         """檢查並關閉已到期的團購"""
         try:
-            # 從 PostgreSQL 獲取所有開啟的團購
-            current_time = datetime.now(UTC)
-            orders_to_close = GroupOrder.query.filter(
-                GroupOrder.status == 'open',
-                GroupOrder.close_time <= current_time
-            ).all()
-            
-            closed_orders = []
-            
-            # 關閉已到期的團購
-            for order in orders_to_close:
-                self.close_group_order(order.restaurant, order.leader_id)
-                closed_orders.append({
-                    'id': order.id,
-                    'restaurant': order.restaurant,
-                    'leader_id': order.leader_id
-                })
-            
-            return closed_orders
+            with app.app_context():  # 確保在應用上下文中執行
+                # 從 PostgreSQL 獲取所有開啟的團購
+                current_time = datetime.now(UTC)
+                orders_to_close = GroupOrder.query.filter(
+                    GroupOrder.status == 'open',
+                    GroupOrder.close_time <= current_time
+                ).all()
+                
+                closed_orders = []
+                
+                # 關閉已到期的團購
+                for order in orders_to_close:
+                    self.close_group_order(order.restaurant, order.leader_id)
+                    closed_orders.append({
+                        'id': order.id,
+                        'restaurant': order.restaurant,
+                        'leader_id': order.leader_id
+                    })
+                
+                return closed_orders
         except Exception as e:
             print(f"檢查並關閉到期團購時發生錯誤: {e}")
             return []
