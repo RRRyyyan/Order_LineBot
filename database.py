@@ -55,12 +55,14 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
             # 在 Redis 中設置即時狀態
             redis_key = f'group_order:{group_order.id}'
             try:
+                # 使用 Redis 的 hset 命令將團購資訊儲存為 hash 結構
+                # redis_key 格式為 'group_order:{id}'
                 self.redis.hset(redis_key, mapping={
-                    'restaurant': restaurant,
-                    'leader_id': leader_id,
-                    'status': 'open',
-                    'created_at': str(datetime.now(UTC)),
-                    'close_time': group_order.close_time.isoformat() if group_order.close_time else ''
+                    'restaurant': restaurant,      # 儲存餐廳名稱
+                    'leader_id': leader_id,       # 儲存開團者 ID
+                    'status': 'open',             # 設定團購狀態為開啟
+                    'created_at': str(datetime.now(UTC)),  # 儲存建立時間(UTC)
+                    'close_time': group_order.close_time.isoformat() if group_order.close_time else ''  # 儲存預計關閉時間,若無則存空字串
                 })
             except Exception as redis_error:
                 print(f"Redis 錯誤: {redis_error}")
@@ -73,6 +75,56 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
             raise  # 重新拋出異常以便上層處理
 
     def get_active_orders(self):
+        try:
+            active_orders = []
+            self.redis.ping()
+
+            # 先從 PostgreSQL 獲取活躍訂單
+            with app.app_context():
+                pg_orders = GroupOrder.query.filter_by(status='open').all()
+                
+                # 將 PostgreSQL 訂單同步到 Redis
+                for order in pg_orders:
+                    redis_key = f'group_order:{order.id}'
+                    # 每次都更新 Redis 中的資料
+                    self.redis.hset(
+                        redis_key,
+                        mapping={
+                            'restaurant': str(order.restaurant),
+                            'leader_id': str(order.leader_id),
+                            'status': 'open',
+                            'close_time': order.close_time.isoformat() if order.close_time else '',
+                            'id': str(order.id)
+                        }
+                    )
+
+                    # 同步該團購的所有用戶訂單
+                    user_orders = UserOrder.query.filter_by(group_order_id=order.id).all()
+                    for user_order in user_orders:
+                        self.redis.hset(
+                            f'group_order:{order.id}:orders',
+                            user_order.user_id,
+                            json.dumps(user_order.items)
+                        )
+
+                    # 從 Redis 讀取資料並正確處理編碼
+                    order_data = self.redis.hgetall(redis_key)
+                    order_dict = {
+                        'id': order_data.get("id", '') or '',
+                        'restaurant': order_data.get('restaurant', '') or '',
+                        'leader_id': order_data.get('leader_id', '') or '',
+                        'status': order_data.get('status', '') or '',
+                        'close_time': order_data.get('close_time', '') or ''
+                    }
+                    active_orders.append(order_dict)
+
+            return active_orders
+
+        except Exception as e:
+            app.logger.error(f"獲取活躍訂單時發生錯誤: {e}")
+            return []
+    
+    def get_closed_orders(self):
         try:
             # 初始化一個空列表，用於存儲活躍的訂單
             active_orders = []
@@ -92,7 +144,7 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
                     # 檢查訂單數據是否存在，並且狀態是 'open'
                     # 使用 .get() 方法安全地獲取狀態，預設為空字節串
                     # 使用 decode() 將字節串轉換為普通字串
-                    if order_data and order_data.get(b'status', b'').decode() == 'open':
+                    if order_data and order_data.get(b'status', b'').decode() == 'closed':
                         # 如果訂單是活躍的，將其添加到 active_orders 列表
                         active_orders.append({
                             # 從鍵中提取訂單 ID（假設鍵的格式是 'group_order:ID'）
@@ -155,17 +207,22 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
         redis_key = f'group_order:{group_order_id}:orders'  # 生成 Redis 鍵
         self.redis.hset(redis_key, user_id, json.dumps(items))  # 使用 Redis 的 Hash 類型存儲用戶訂單
 
-    def get_user_orders(self, group_order_id):  # 獲取團購中的所有訂單
+    def get_user_orders(self, group_order_id):
         """獲取團購中的所有訂單"""
         redis_key = f'group_order:{group_order_id}:orders'  # 生成 Redis 鍵
         orders = self.redis.hgetall(redis_key)  # 獲取團購中的所有訂單
-        return {k.decode(): json.loads(v.decode()) for k, v in orders.items()}  # 返回解析後的訂單字典
+        return {k: json.loads(v) for k, v in orders.items()}  # 直接使用字串，不需要 decode
 
-    def get_user_order(self, group_order_id, user_id):  # 獲取特定用戶的訂單
+    def get_user_order(self, group_order_id, user_id):
         """獲取特定用戶的訂單"""
-        redis_key = f'group_order:{group_order_id}:orders'  # 生成 Redis 鍵
-        order = self.redis.hget(redis_key, user_id)  # 獲取特定用戶的訂單
-        return json.loads(order.decode()) if order else None  # 返回解析後的訂單，或者如果不存在則返回 None
+        redis_key = f'group_order:{group_order_id}:orders'
+        order = self.redis.hget(redis_key, user_id)
+        if order:
+            if isinstance(order, bytes):
+                return json.loads(order.decode())
+            else:
+                return json.loads(order)
+        return None
     
     def delete_user_order(self, group_order_id, user_id):
         """刪除訂單"""
@@ -193,22 +250,34 @@ class DatabaseManager:  # 定義 DatabaseManager 類別
 
     def set_group_order_close_time(self, group_order_id, close_time):
         """設定團購閉團時間"""
-        # 確保 close_time 是 UTC 時間
-        close_time = close_time.astimezone(timezone.utc)  # 確保寫入的是 UTC 時間
         try:
-            # 更新 PostgreSQL
-            group_order = GroupOrder.query.get(group_order_id)
-            if group_order:
-                group_order.close_time = close_time.astimezone(timezone.utc).replace(tzinfo=None)
-                db.session.commit()
+            with app.app_context():
+                # 確保 group_order_id 是整數
+                group_order_id = int(group_order_id)
                 
-                # 更新 Redis
-                redis_key = f'group_order:{group_order_id}'
-                self.redis.hset(redis_key, 'close_time', close_time.isoformat())
-                return True
-            return False
+                # 如果輸入的時間沒有時區信息，假設它是台灣時間
+                if close_time.tzinfo is None:
+                    tw_tz = timezone(timedelta(hours=8))
+                    close_time = close_time.replace(tzinfo=tw_tz)
+                
+                # 保持時區信息，不要移除
+                utc_time = close_time.astimezone(UTC)
+                
+                # 更新 PostgreSQL，保留時區信息
+                group_order = GroupOrder.query.get(group_order_id)
+                if group_order:
+                    # 直接存儲 UTC 時間，保留時區信息
+                    group_order.close_time = utc_time
+                    db.session.commit()
+                    
+                    # 更新 Redis，存儲帶時區的 ISO 格式時間字符串
+                    redis_key = f'group_order:{group_order_id}'
+                    self.redis.hset(redis_key, 'close_time', utc_time.isoformat())
+                    return True
+                return False
         except Exception as e:
             print(f"設定閉團時間時發生錯誤: {e}")
+            db.session.rollback()
             return False
     
     def check_and_close_expired_orders(self):

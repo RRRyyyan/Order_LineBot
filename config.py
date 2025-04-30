@@ -33,6 +33,8 @@ class Config:
     SQLALCHEMY_DATABASE_URI = "postgresql://postgres:ryan0404@localhost:5432/line_bot_db"
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     REDIS_URL = "redis://localhost:6379/0"
+    # 定時任務設置
+    SCHEDULER_INTERVAL_MINUTES = 5  # 每 5 分鐘檢查一次過期團購
 
 class DevelopmentConfig(Config):
    DEBUG = True
